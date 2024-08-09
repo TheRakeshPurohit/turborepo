@@ -39,6 +39,7 @@ jobs:
           PATTERNS: |
             Cargo.*
             rust-toolchain
+            cli/turbo.json
 
       - name: Turborepo version changes
         id: turborepo_version
@@ -136,7 +137,6 @@ jobs:
       - name: Setup Turborepo Environment
         uses: ./.github/actions/setup-turborepo-environment
         with:
-          windows: ${{ matrix.os.runner == 'windows-latest' }}
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           node-version: "18.20.2"
 
@@ -169,7 +169,7 @@ jobs:
     needs: [determine_jobs, build_turborepo]
     if: needs.determine_jobs.outputs.turborepo_integration == 'true'
     runs-on: ${{ matrix.os.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +193,6 @@ jobs:
       - name: Setup Turborepo Environment
         uses: ./.github/actions/setup-turborepo-environment
         with:
-          windows: ${{ matrix.os.runner == 'windows-latest' }}
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           node-version: "18.20.2"
 
@@ -373,7 +372,6 @@ jobs:
       - name: Setup Turborepo Environment
         uses: ./.github/actions/setup-turborepo-environment
         with:
-          windows: ${{ matrix.os.runner == 'windows-latest' }}
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           node-version: "18.20.2"
 

@@ -10,6 +10,7 @@ use console::{Style, StyledObject};
 use either::Either;
 use futures::{stream::FuturesUnordered, StreamExt};
 use itertools::Itertools;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use regex::Regex;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, Instrument, Span};
@@ -24,8 +25,8 @@ use turborepo_telemetry::events::{
     generic::GenericEventBuilder, task::PackageTaskEventBuilder, EventBuilder, TrackedErrors,
 };
 use turborepo_ui::{
-    tui::{self, AppSender, TuiTask},
-    ColorSelector, OutputClient, OutputSink, OutputWriter, PrefixedUI, UI,
+    tui::{self, event::CacheResult, AppSender, TuiTask},
+    ColorConfig, ColorSelector, OutputClient, OutputSink, OutputWriter, PrefixedUI,
 };
 use which::which;
 
@@ -62,12 +63,12 @@ pub struct Visitor<'a> {
     task_access: &'a TaskAccess,
     sink: OutputSink<StdWriter>,
     task_hasher: TaskHasher<'a>,
-    ui: UI,
+    color_config: ColorConfig,
     experimental_ui_sender: Option<AppSender>,
     is_watch: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum Error {
     #[error("cannot find package {package_name} for task {task_id}")]
     MissingPackage {
@@ -77,7 +78,14 @@ pub enum Error {
     #[error(
         "root task {task_name} ({command}) looks like it invokes turbo and might cause a loop"
     )]
-    RecursiveTurbo { task_name: String, command: String },
+    RecursiveTurbo {
+        task_name: String,
+        command: String,
+        #[label("task found here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
     #[error("Could not find definition for task")]
     MissingDefinition,
     #[error("error while executing engine: {0}")]
@@ -105,7 +113,7 @@ impl<'a> Visitor<'a> {
         env_at_execution_start: &'a EnvironmentVariableMap,
         global_hash: &'a str,
         global_env_mode: EnvMode,
-        ui: UI,
+        color_config: ColorConfig,
         manager: ProcessManager,
         repo_root: &'a AbsoluteSystemPath,
         global_env: EnvironmentVariableMap,
@@ -135,7 +143,7 @@ impl<'a> Visitor<'a> {
             task_access,
             sink,
             task_hasher,
-            ui,
+            color_config,
             global_env,
             experimental_ui_sender,
             is_watch,
@@ -186,9 +194,12 @@ impl<'a> Visitor<'a> {
             match command {
                 Some(cmd) if info.package() == ROOT_PKG_NAME && turbo_regex().is_match(&cmd) => {
                     package_task_event.track_error(TrackedErrors::RecursiveError);
+                    let (span, text) = cmd.span_and_text("package.json");
                     return Err(Error::RecursiveTurbo {
                         task_name: info.to_string(),
                         command: cmd.to_string(),
+                        span,
+                        text,
                     });
                 }
                 _ => (),
@@ -242,7 +253,7 @@ impl<'a> Visitor<'a> {
                     }));
                 }
                 false => {
-                    // TODO(gsoltis): if/when we fix https://github.com/vercel/turbo/issues/937
+                    // TODO(gsoltis): if/when we fix https://github.com/vercel/turborepo/issues/937
                     // the following block should never get hit. In the meantime, keep it after
                     // hashing so that downstream tasks can count on the hash existing
                     //
@@ -349,7 +360,7 @@ impl<'a> Visitor<'a> {
     ) -> Result<(), Error> {
         let Self {
             package_graph,
-            ui,
+            color_config: ui,
             run_opts,
             repo_root,
             global_env_mode,
@@ -451,17 +462,17 @@ impl<'a> Visitor<'a> {
     }
 
     fn prefixed_ui<W: Write>(
-        ui: UI,
+        color_config: ColorConfig,
         is_github_actions: bool,
         stdout: W,
         stderr: W,
         prefix: StyledObject<String>,
     ) -> PrefixedUI<W> {
-        let mut prefixed_ui = PrefixedUI::new(ui, stdout, stderr)
+        let mut prefixed_ui = PrefixedUI::new(color_config, stdout, stderr)
             .with_output_prefix(prefix.clone())
             // TODO: we can probably come up with a more ergonomic way to achieve this
             .with_error_prefix(
-                Style::new().apply_to(format!("{}ERROR: ", ui.apply(prefix.clone()))),
+                Style::new().apply_to(format!("{}ERROR: ", color_config.apply(prefix.clone()))),
             )
             .with_warn_prefix(prefix);
         if is_github_actions {
@@ -650,7 +661,7 @@ impl<'a> ExecContextFactory<'a> {
         let pass_through_args = self.visitor.run_opts.args_for_task(&task_id);
         ExecContext {
             engine: self.engine.clone(),
-            ui: self.visitor.ui,
+            color_config: self.visitor.color_config,
             experimental_ui: self.visitor.experimental_ui_sender.is_some(),
             is_github_actions: self.visitor.run_opts.is_github_actions,
             pretty_prefix: self
@@ -689,7 +700,7 @@ impl<'a> ExecContextFactory<'a> {
 
 struct ExecContext {
     engine: Arc<Engine>,
-    ui: UI,
+    color_config: ColorConfig,
     experimental_ui: bool,
     is_github_actions: bool,
     pretty_prefix: StyledObject<String>,
@@ -755,7 +766,8 @@ impl ExecContext {
         // If the task resulted in an error, do not group in order to better highlight
         // the error.
         let is_error = matches!(result, Ok(ExecOutcome::Task { .. }));
-        let logs = match output_client.finish(is_error) {
+        let is_cache_hit = matches!(result, Ok(ExecOutcome::Success(SuccessOutcome::CacheHit)));
+        let logs = match output_client.finish(is_error, is_cache_hit) {
             Ok(logs) => logs,
             Err(e) => {
                 telemetry.track_error(TrackedErrors::DaemonFailedToMarkOutputsAsCached);
@@ -833,7 +845,7 @@ impl ExecContext {
     ) -> TaskCacheOutput<OutputWriter<'a, W>> {
         match output_client {
             TaskOutput::Direct(client) => TaskCacheOutput::Direct(Visitor::prefixed_ui(
-                self.ui,
+                self.color_config,
                 self.is_github_actions,
                 client.stdout(),
                 client.stderr(),
@@ -853,7 +865,8 @@ impl ExecContext {
 
         if self.experimental_ui {
             if let TaskOutput::UI(task) = output_client {
-                task.start();
+                let output_logs = self.task_cache.output_logs().into();
+                task.start(output_logs);
             }
         }
 
@@ -899,6 +912,12 @@ impl ExecContext {
         cmd.envs(self.execution_env.iter());
         // Always last to make sure it overwrites any user configured env var.
         cmd.env("TURBO_HASH", &self.task_hash);
+
+        // Allow downstream tools to detect if the task is being ran with TUI
+        if self.experimental_ui {
+            cmd.env("TURBO_IS_TUI", "true");
+        }
+
         // enable task access tracing
 
         // set the trace file env var - frameworks that support this can use it to
@@ -938,6 +957,13 @@ impl ExecContext {
                     task.set_stdin(stdin);
                 }
             }
+        }
+
+        // Even if user does not have the TUI and cannot interact with a task, we keep
+        // stdin open for persistent tasks as some programs will shut down if stdin is
+        // closed.
+        if !self.takes_input && !self.manager.closing_stdin_ends_process() {
+            process.stdin();
         }
 
         let mut stdout_writer = self
@@ -1088,10 +1114,10 @@ impl<W: Write> TaskCacheOutput<W> {
 }
 
 impl<W: Write> CacheOutput for TaskCacheOutput<W> {
-    fn status(&mut self, message: &str) {
+    fn status(&mut self, message: &str, result: CacheResult) {
         match self {
             TaskCacheOutput::Direct(direct) => direct.output(message),
-            TaskCacheOutput::UI(task) => task.status(message),
+            TaskCacheOutput::UI(task) => task.status(message, result),
         }
     }
 
@@ -1117,11 +1143,11 @@ impl<W: Write> CacheOutput for TaskCacheOutput<W> {
 
 /// Struct for displaying information about task
 impl<W: Write> TaskOutput<W> {
-    pub fn finish(self, use_error: bool) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn finish(self, use_error: bool, is_cache_hit: bool) -> std::io::Result<Option<Vec<u8>>> {
         match self {
             TaskOutput::Direct(client) => client.finish(use_error),
             TaskOutput::UI(client) if use_error => Ok(Some(client.failed())),
-            TaskOutput::UI(client) => Ok(Some(client.succeeded())),
+            TaskOutput::UI(client) => Ok(Some(client.succeeded(is_cache_hit))),
         }
     }
 

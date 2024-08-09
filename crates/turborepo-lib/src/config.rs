@@ -14,8 +14,8 @@ use turborepo_auth::{TURBO_TOKEN_DIR, TURBO_TOKEN_FILE, VERCEL_TOKEN_DIR, VERCEL
 use turborepo_dirs::{config_dir, vercel_config_dir};
 use turborepo_errors::TURBO_SITE;
 
-pub use crate::turbo_json::RawTurboJson;
-use crate::{commands::CommandBase, turbo_json};
+pub use crate::turbo_json::{RawTurboJson, UIMode};
+use crate::{cli::EnvMode, commands::CommandBase, turbo_json};
 
 #[derive(Debug, Error, Diagnostic)]
 #[error("Environment variables should not be prefixed with \"{env_pipeline_delimiter}\"")]
@@ -207,7 +207,14 @@ pub struct ConfigurationOptions {
     pub(crate) enabled: Option<bool>,
     pub(crate) spaces_id: Option<String>,
     #[serde(rename = "ui")]
-    pub(crate) ui: Option<bool>,
+    pub(crate) ui: Option<UIMode>,
+    #[serde(rename = "dangerouslyDisablePackageManagerCheck")]
+    pub(crate) allow_no_package_manager: Option<bool>,
+    pub(crate) daemon: Option<bool>,
+    #[serde(rename = "envMode")]
+    pub(crate) env_mode: Option<EnvMode>,
+    pub(crate) scm_base: Option<String>,
+    pub(crate) scm_head: Option<String>,
 }
 
 #[derive(Default)]
@@ -271,14 +278,47 @@ impl ConfigurationOptions {
         self.spaces_id.as_deref()
     }
 
-    pub fn ui(&self) -> bool {
-        self.ui.unwrap_or(false) && atty::is(atty::Stream::Stdout)
+    pub fn ui(&self) -> UIMode {
+        // If we aren't hooked up to a TTY, then do not use TUI
+        if !atty::is(atty::Stream::Stdout) {
+            return UIMode::Stream;
+        }
+
+        self.ui.unwrap_or(UIMode::Stream)
+    }
+
+    pub fn scm_base(&self) -> &str {
+        self.scm_base.as_deref().unwrap_or("main")
+    }
+
+    pub fn scm_head(&self) -> &str {
+        self.scm_head.as_deref().unwrap_or("HEAD")
+    }
+
+    pub fn allow_no_package_manager(&self) -> bool {
+        self.allow_no_package_manager.unwrap_or_default()
+    }
+
+    pub fn daemon(&self) -> Option<bool> {
+        self.daemon
+    }
+
+    pub fn env_mode(&self) -> EnvMode {
+        self.env_mode.unwrap_or_default()
     }
 }
 
 // Maps Some("") to None to emulate how Go handles empty strings
 fn non_empty_str(s: Option<&str>) -> Option<&str> {
     s.filter(|s| !s.is_empty())
+}
+
+fn truth_env_var(s: &str) -> Option<bool> {
+    match s {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 trait ResolvedConfigurationOptions {
@@ -298,7 +338,10 @@ impl ResolvedConfigurationOptions for RawTurboJson {
             .experimental_spaces
             .and_then(|spaces| spaces.id)
             .map(|spaces_id| spaces_id.into());
-        opts.ui = self.ui.map(|ui| ui.use_tui());
+        opts.ui = self.ui;
+        opts.allow_no_package_manager = self.allow_no_package_manager;
+        opts.daemon = self.daemon.map(|daemon| *daemon.as_inner());
+        opts.env_mode = self.env_mode;
         Ok(opts)
     }
 }
@@ -331,7 +374,15 @@ fn get_env_var_config(
         "upload_timeout",
     );
     turbo_mapping.insert(OsString::from("turbo_ui"), "ui");
+    turbo_mapping.insert(
+        OsString::from("turbo_dangerously_disable_package_manager_check"),
+        "allow_no_package_manager",
+    );
+    turbo_mapping.insert(OsString::from("turbo_daemon"), "daemon");
+    turbo_mapping.insert(OsString::from("turbo_env_mode"), "env_mode");
     turbo_mapping.insert(OsString::from("turbo_preflight"), "preflight");
+    turbo_mapping.insert(OsString::from("turbo_scm_base"), "scm_base");
+    turbo_mapping.insert(OsString::from("turbo_scm_head"), "scm_head");
 
     // We do not enable new config sources:
     // turbo_mapping.insert(String::from("turbo_signature"), "signature"); // new
@@ -412,11 +463,32 @@ fn get_env_var_config(
     };
 
     // Process experimentalUI
-    let ui = output_map.get("ui").and_then(|val| match val.as_str() {
-        "true" | "1" => Some(true),
-        "false" | "0" => Some(false),
+    let ui = output_map
+        .get("ui")
+        .map(|s| s.as_str())
+        .and_then(truth_env_var)
+        .map(|ui| if ui { UIMode::Tui } else { UIMode::Stream });
+
+    let allow_no_package_manager = output_map
+        .get("allow_no_package_manager")
+        .map(|s| s.as_str())
+        .and_then(truth_env_var);
+
+    // Process daemon
+    let daemon = output_map.get("daemon").and_then(|val| match val.as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
         _ => None,
     });
+
+    let env_mode = output_map
+        .get("env_mode")
+        .map(|s| s.as_str())
+        .and_then(|s| match s {
+            "strict" => Some(EnvMode::Strict),
+            "loose" => Some(EnvMode::Loose),
+            _ => None,
+        });
 
     // We currently don't pick up a Spaces ID via env var, we likely won't
     // continue using the Spaces name, we can add an env var when we have the
@@ -429,17 +501,22 @@ fn get_env_var_config(
         team_slug: output_map.get("team_slug").cloned(),
         team_id: output_map.get("team_id").cloned(),
         token: output_map.get("token").cloned(),
+        scm_base: output_map.get("scm_base").cloned(),
+        scm_head: output_map.get("scm_head").cloned(),
 
         // Processed booleans
         signature,
         preflight,
         enabled,
         ui,
+        allow_no_package_manager,
+        daemon,
 
         // Processed numbers
         timeout,
         upload_timeout,
         spaces_id,
+        env_mode,
     };
 
     Ok(output)
@@ -478,7 +555,7 @@ fn get_override_env_var_config(
         .and_then(|value| {
             // If either of these are truthy, then we disable the TUI
             if value == "true" || value == "1" {
-                Some(false)
+                Some(UIMode::Stream)
             } else {
                 None
             }
@@ -490,14 +567,19 @@ fn get_override_env_var_config(
         team_slug: None,
         team_id: output_map.get("team_id").cloned(),
         token: output_map.get("token").cloned(),
+        scm_base: None,
+        scm_head: None,
 
         signature: None,
         preflight: None,
         enabled: None,
         ui,
+        daemon: None,
         timeout: None,
         upload_timeout: None,
         spaces_id: None,
+        allow_no_package_manager: None,
+        env_mode: None,
     };
 
     Ok(output)
@@ -632,7 +714,14 @@ impl TurborepoConfigBuilder {
     create_builder!(with_enabled, enabled, Option<bool>);
     create_builder!(with_preflight, preflight, Option<bool>);
     create_builder!(with_timeout, timeout, Option<u64>);
-    create_builder!(with_ui, ui, Option<bool>);
+    create_builder!(with_ui, ui, Option<UIMode>);
+    create_builder!(
+        with_allow_no_package_manager,
+        allow_no_package_manager,
+        Option<bool>
+    );
+    create_builder!(with_daemon, daemon, Option<bool>);
+    create_builder!(with_env_mode, env_mode, Option<EnvMode>);
 
     pub fn build(&self) -> Result<ConfigurationOptions, Error> {
         // Priority, from least significant to most significant:
@@ -710,6 +799,23 @@ impl TurborepoConfigBuilder {
                     if let Some(ui) = current_source_config.ui {
                         acc.ui = Some(ui);
                     }
+                    if let Some(allow_no_package_manager) =
+                        current_source_config.allow_no_package_manager
+                    {
+                        acc.allow_no_package_manager = Some(allow_no_package_manager);
+                    }
+                    if let Some(daemon) = current_source_config.daemon {
+                        acc.daemon = Some(daemon);
+                    }
+                    if let Some(env_mode) = current_source_config.env_mode {
+                        acc.env_mode = Some(env_mode);
+                    }
+                    if let Some(scm_base) = current_source_config.scm_base {
+                        acc.scm_base = Some(scm_base);
+                    }
+                    if let Some(scm_head) = current_source_config.scm_head {
+                        acc.scm_head = Some(scm_head);
+                    }
 
                     acc
                 })
@@ -725,9 +831,13 @@ mod test {
     use tempfile::TempDir;
     use turbopath::AbsoluteSystemPathBuf;
 
-    use crate::config::{
-        get_env_var_config, get_override_env_var_config, ConfigurationOptions,
-        TurborepoConfigBuilder, DEFAULT_API_URL, DEFAULT_LOGIN_URL, DEFAULT_TIMEOUT,
+    use crate::{
+        cli::EnvMode,
+        config::{
+            get_env_var_config, get_override_env_var_config, ConfigurationOptions,
+            TurborepoConfigBuilder, DEFAULT_API_URL, DEFAULT_LOGIN_URL, DEFAULT_TIMEOUT,
+        },
+        turbo_json::UIMode,
     };
 
     #[test]
@@ -743,6 +853,7 @@ mod test {
         assert!(!defaults.preflight());
         assert_eq!(defaults.timeout(), DEFAULT_TIMEOUT);
         assert_eq!(defaults.spaces_id(), None);
+        assert!(!defaults.allow_no_package_manager());
     }
 
     #[test]
@@ -766,7 +877,13 @@ mod test {
             turbo_remote_cache_timeout.to_string().into(),
         );
         env.insert("turbo_ui".into(), "true".into());
+        env.insert(
+            "turbo_dangerously_disable_package_manager_check".into(),
+            "true".into(),
+        );
+        env.insert("turbo_daemon".into(), "true".into());
         env.insert("turbo_preflight".into(), "true".into());
+        env.insert("turbo_env_mode".into(), "strict".into());
 
         let config = get_env_var_config(&env).unwrap();
         assert!(config.preflight());
@@ -776,7 +893,10 @@ mod test {
         assert_eq!(turbo_teamid, config.team_id.unwrap());
         assert_eq!(turbo_token, config.token.unwrap());
         assert_eq!(turbo_remote_cache_timeout, config.timeout.unwrap());
-        assert_eq!(Some(true), config.ui);
+        assert_eq!(Some(UIMode::Tui), config.ui);
+        assert_eq!(Some(true), config.allow_no_package_manager);
+        assert_eq!(Some(true), config.daemon);
+        assert_eq!(Some(EnvMode::Strict), config.env_mode);
     }
 
     #[test]
@@ -788,6 +908,8 @@ mod test {
         env.insert("turbo_teamid".into(), "".into());
         env.insert("turbo_token".into(), "".into());
         env.insert("turbo_ui".into(), "".into());
+        env.insert("turbo_daemon".into(), "".into());
+        env.insert("turbo_env_mode".into(), "".into());
         env.insert("turbo_preflight".into(), "".into());
 
         let config = get_env_var_config(&env).unwrap();
@@ -797,6 +919,8 @@ mod test {
         assert_eq!(config.team_id(), None);
         assert_eq!(config.token(), None);
         assert_eq!(config.ui, None);
+        assert_eq!(config.daemon, None);
+        assert_eq!(config.env_mode, None);
         assert!(!config.preflight());
     }
 
@@ -820,7 +944,7 @@ mod test {
         let config = get_override_env_var_config(&env).unwrap();
         assert_eq!(vercel_artifacts_token, config.token.unwrap());
         assert_eq!(vercel_artifacts_owner, config.team_id.unwrap());
-        assert_eq!(Some(false), config.ui);
+        assert_eq!(Some(UIMode::Stream), config.ui);
     }
 
     #[test]

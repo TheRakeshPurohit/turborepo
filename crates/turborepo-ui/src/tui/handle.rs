@@ -3,7 +3,10 @@ use std::{
     time::Instant,
 };
 
-use super::{Event, TaskResult};
+use super::{
+    event::{CacheResult, OutputLogs},
+    Event, TaskResult,
+};
 
 /// Struct for sending app events to TUI rendering
 #[derive(Debug, Clone)]
@@ -64,6 +67,11 @@ impl AppSender {
     pub fn update_tasks(&self, tasks: Vec<String>) -> Result<(), mpsc::SendError<Event>> {
         self.primary.send(Event::UpdateTasks { tasks })
     }
+
+    /// Restart the list of tasks displayed in the TUI
+    pub fn restart_tasks(&self, tasks: Vec<String>) -> Result<(), mpsc::SendError<Event>> {
+        self.primary.send(Event::RestartTasks { tasks })
+    }
 }
 
 impl AppReceiver {
@@ -85,18 +93,23 @@ impl TuiTask {
     }
 
     /// Mark the task as started
-    pub fn start(&self) {
+    pub fn start(&self, output_logs: OutputLogs) {
         self.handle
             .primary
             .send(Event::StartTask {
                 task: self.name.clone(),
+                output_logs,
             })
             .ok();
     }
 
     /// Mark the task as finished
-    pub fn succeeded(&self) -> Vec<u8> {
-        self.finish(TaskResult::Success)
+    pub fn succeeded(&self, is_cache_hit: bool) -> Vec<u8> {
+        if is_cache_hit {
+            self.finish(TaskResult::CacheHit)
+        } else {
+            self.finish(TaskResult::Success)
+        }
     }
 
     /// Mark the task as finished
@@ -125,7 +138,7 @@ impl TuiTask {
             .ok();
     }
 
-    pub fn status(&self, status: &str) {
+    pub fn status(&self, status: &str, result: CacheResult) {
         // Since this will be rendered via ratatui we any ANSI escape codes will not be
         // handled.
         // TODO: prevent the status from having ANSI codes in this scenario
@@ -135,6 +148,7 @@ impl TuiTask {
             .send(Event::Status {
                 task: self.name.clone(),
                 status,
+                result,
             })
             .ok();
     }

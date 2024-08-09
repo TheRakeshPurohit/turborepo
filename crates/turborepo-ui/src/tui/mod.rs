@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 pub mod event;
 mod handle;
 mod input;
@@ -6,13 +7,16 @@ mod pane;
 mod spinner;
 mod table;
 mod task;
+mod term_output;
 
 pub use app::{run_app, terminal_big_enough};
+use clipboard::copy_to_clipboard;
 use event::{Event, TaskResult};
 pub use handle::{AppReceiver, AppSender, TuiTask};
 use input::{input, InputOptions};
 pub use pane::TerminalPane;
 pub use table::TaskTable;
+pub use term_output::TerminalOutput;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
