@@ -43,6 +43,15 @@ on:
       dry_run:
         description: "Do a dry run, skipping the final publish step."
         type: boolean
+      tag-override:
+        description: "Override default npm dist-tag for the release. Should only be used for backporting"
+        required: false
+        type: string
+      ci-tag-override:
+        description: "Override default npm dist-tag to use for running tests. Should only be used when the most recent release was faulty"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   stage:
@@ -58,7 +67,7 @@ jobs:
           git config --global user.email 'turbobot@vercel.com'
       - name: Version
         run: |
-          ./scripts/version.js ${{ inputs.increment }}
+          ./scripts/version.js ${{ inputs.increment }} ${{ inputs.tag-override }}
           cat version.txt
       - name: Stage Commit
         id: stage
@@ -103,12 +112,14 @@ jobs:
           node-version: "20"
       - name: Install Global Turbo
         uses: ./.github/actions/install-global-turbo
+        with:
+          turbo-version: "${{ github.event.inputs.ci-tag-override }}"
       - name: Run JS Package Tests
         run: turbo run check-types test --filter="./packages/*" --color
 
   build-rust:
     name: "Build Rust"
-    needs: [stage, rust-smoke-test, js-smoke-test]
+    needs: [stage]
     strategy:
       fail-fast: false
       matrix:
@@ -190,7 +201,7 @@ jobs:
   npm-publish:
     name: "Publish To NPM"
     runs-on: ubuntu-latest
-    needs: [stage, build-rust]
+    needs: [stage, build-rust, rust-smoke-test, js-smoke-test]
     steps:
       - name: Show Stage Commit
         run: echo "${{ needs.stage.outputs.stage-branch }}"
@@ -204,20 +215,13 @@ jobs:
 
       - name: Install Global Turbo
         uses: ./.github/actions/install-global-turbo
+        with:
+          turbo-version: "${{ github.event.inputs.ci-tag-override }}"
 
       - name: Configure git
         run: |
           git config --global user.name 'Turbobot'
           git config --global user.email 'turbobot@vercel.com'
-
-      - name: Install GoReleaser
-        uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser-pro
-          version: v1.18.2
-          install-only: true
-        env:
-          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
 
       - name: Download Rust artifacts
         uses: actions/download-artifact@v4
@@ -229,14 +233,13 @@ jobs:
           mv rust-artifacts/turbo-aarch64-apple-darwin cli/dist-darwin-arm64
           mv rust-artifacts/turbo-aarch64-unknown-linux-musl cli/dist-linux-arm64
           cp -r rust-artifacts/turbo-x86_64-pc-windows-msvc cli/dist-windows-arm64
-          mv rust-artifacts/turbo-x86_64-unknown-linux-musl cli/dist-linux-amd64
-          mv rust-artifacts/turbo-x86_64-apple-darwin cli/dist-darwin-amd64
-          mv rust-artifacts/turbo-x86_64-pc-windows-msvc cli/dist-windows-amd64
+          mv rust-artifacts/turbo-x86_64-unknown-linux-musl cli/dist-linux-x64
+          mv rust-artifacts/turbo-x86_64-apple-darwin cli/dist-darwin-x64
+          mv rust-artifacts/turbo-x86_64-pc-windows-msvc cli/dist-windows-x64
 
       - name: Perform Release
         run: cd cli && make publish-turbo SKIP_PUBLISH=${{ inputs.dry_run && '--skip-publish' || '' }}
         env:
-          GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Upload published artifacts in case they are needed for debugging later

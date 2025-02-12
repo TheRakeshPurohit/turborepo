@@ -51,7 +51,7 @@ pub enum Error {
     PackageJson(#[from] crate::package_json::Error),
     #[error("package.json must have a name field:\n{0}")]
     PackageJsonMissingName(AbsoluteSystemPathBuf),
-    #[error("Invalid package dependency graph: {0}")]
+    #[error("Invalid package dependency graph:")]
     InvalidPackageGraph(#[source] graph::Error),
     #[error(transparent)]
     Lockfile(#[from] turborepo_lockfiles::Error),
@@ -119,7 +119,7 @@ impl<'a, P> PackageGraphBuilder<'a, P> {
     }
 }
 
-impl<'a, T> PackageGraphBuilder<'a, T>
+impl<T> PackageGraphBuilder<'_, T>
 where
     T: PackageDiscoveryBuilder,
     T::Output: Send + Sync,
@@ -469,7 +469,7 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedWorkspaces, T> {
     }
 }
 
-impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedLockfile, T> {
+impl<T: PackageDiscovery> BuildState<'_, ResolvedLockfile, T> {
     fn all_external_dependencies(&self) -> Result<HashMap<String, HashMap<String, String>>, Error> {
         self.workspaces
             .values()
