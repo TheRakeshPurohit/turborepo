@@ -2,6 +2,7 @@ mod boundaries;
 mod external_package;
 mod file;
 mod package;
+mod package_graph;
 mod server;
 mod task;
 
@@ -14,7 +15,9 @@ use std::{
 use async_graphql::{http::GraphiQLSource, *};
 use axum::{response, response::IntoResponse};
 use external_package::ExternalPackage;
+use itertools::Itertools;
 use package::Package;
+use package_graph::{Edge, PackageGraph};
 pub use server::run_server;
 use thiserror::Error;
 use tokio::select;
@@ -153,6 +156,7 @@ impl RepositoryQuery {
 #[graphql(concrete(name = "Files", params(File)))]
 #[graphql(concrete(name = "ExternalPackages", params(ExternalPackage)))]
 #[graphql(concrete(name = "Diagnostics", params(Diagnostic)))]
+#[graphql(concrete(name = "Edges", params(Edge)))]
 pub struct Array<T: OutputType> {
     items: Vec<T>,
     length: usize,
@@ -385,7 +389,8 @@ impl PackagePredicate {
         let less_than = self
             .less_than
             .as_ref()
-            .map(|pair| Self::check_greater_than(pkg, &pair.field, &pair.value));
+            .map(|pair| Self::check_less_than(pkg, &pair.field, &pair.value));
+
         let not = self.not.as_ref().map(|predicate| !predicate.check(pkg));
         let has = self
             .has
@@ -565,13 +570,22 @@ impl RepositoryQuery {
     /// Check boundaries for all packages.
     async fn boundaries(&self) -> Result<Array<Diagnostic>, Error> {
         match self.run.check_boundaries().await {
-            Ok(result) => {
-                result.emit();
-
-                Ok(result.diagnostics.into_iter().map(|b| b.into()).collect())
-            }
+            Ok(result) => Ok(result
+                .diagnostics
+                .into_iter()
+                .map(|b| b.into())
+                .sorted_by(|a: &Diagnostic, b: &Diagnostic| a.message.cmp(&b.message))
+                .collect()),
             Err(err) => Err(Error::Boundaries(err)),
         }
+    }
+
+    async fn package_graph(
+        &self,
+        center: Option<String>,
+        filter: Option<PackagePredicate>,
+    ) -> PackageGraph {
+        PackageGraph::new(self.run.clone(), center, filter)
     }
 
     async fn file(&self, path: String) -> Result<File, Error> {
@@ -602,7 +616,7 @@ impl RepositoryQuery {
             .pkg_dep_graph()
             .packages()
             .map(|(name, _)| Package::new(self.run.clone(), name.clone()))
-            .filter(|pkg| pkg.as_ref().map_or(false, |pkg| filter.check(pkg)))
+            .filter(|pkg| pkg.as_ref().is_ok_and(|pkg| filter.check(pkg)))
             .collect::<Result<Array<_>, _>>()?;
         packages.sort_by(|a, b| a.get_name().cmp(b.get_name()));
 
